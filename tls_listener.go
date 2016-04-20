@@ -10,11 +10,16 @@ import (
 	"time"
 )
 
+type OcspTLSListener interface {
+	UpdateTLSConfig(cfg *tls.Config)
+}
+
 type ocspTlsListener struct {
 	net.Listener
 	tlsConfigWriteMutex sync.Mutex
 	tlsConfig atomic.Value
 	donePolling chan interface{}
+	pollersWaitGroup sync.WaitGroup
 }
 
 func NewOcspTLSListener(inner net.Listener, config *tls.Config) net.Listener {
@@ -36,6 +41,12 @@ func (ln *ocspTlsListener) Accept() (c net.Conn, err error) {
 func (ln *ocspTlsListener) Close() error {
 	close(ln.donePolling)
 	return ln.Listener.Close()
+}
+
+func (ln *ocspTlsListener) UpdateTLSConfig(cfg *tls.Config) {
+	ln.stopPollers()
+	ln.updateTLSConfig(cfg)
+	ln.startPollers()
 }
 
 func cloneTLSConfig(cfg *tls.Config) *tls.Config {
@@ -66,6 +77,7 @@ func cloneTLSConfig(cfg *tls.Config) *tls.Config {
 }
 
 func (ln *ocspTlsListener) startPollers() {
+	ln.donePolling = make(chan interface{})
 	for i, cert := range ln.tlsConfig.Load().(*tls.Config).Certificates {
 		go func(index int, crt tls.Certificate) {
 			certificates, _ := x509.ParseCertificates(append(crt.Certificate[0], crt.Certificate[1]...))
@@ -74,7 +86,19 @@ func (ln *ocspTlsListener) startPollers() {
 	}
 }
 
+func (ln *ocspTlsListener) stopPollers() {
+	close(ln.donePolling)
+	ln.pollersWaitGroup.Wait()
+}
+
+func (ln *ocspTlsListener) restartPollers() {
+	ln.stopPollers()
+	ln.startPollers()
+}
+
 func (ln *ocspTlsListener) startPoller(index int, certificates []*x509.Certificate) {
+	ln.pollersWaitGroup.Add(1)
+	defer ln.pollersWaitGroup.Done()
 	for {
 		response, err := fetchOCSPResponse(certificates[0], certificates[1])
 		if err != nil {
@@ -94,12 +118,15 @@ func (ln *ocspTlsListener) startPoller(index int, certificates []*x509.Certifica
 }
 
 func (ln *ocspTlsListener) setOCSPResponse(certIndex int, response []byte) {
-	ln.tlsConfigWriteMutex.Lock()
-	defer ln.tlsConfigWriteMutex.Unlock()
-
 	config := cloneTLSConfig(ln.tlsConfig.Load().(*tls.Config))
 	config.Certificates[certIndex].OCSPStaple = response
-	ln.tlsConfig.Store(config)
+	ln.updateTLSConfig(config)
+}
+
+func (ln *ocspTlsListener) updateTLSConfig(cfg *tls.Config) {
+	ln.tlsConfigWriteMutex.Lock()
+	defer ln.tlsConfigWriteMutex.Unlock()
+	ln.tlsConfig.Store(cfg)
 }
 
 func fetchOCSPResponse(cert, issuer *x509.Certificate) (*OSCPResponse, error) {
